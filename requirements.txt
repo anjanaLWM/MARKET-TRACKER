@@ -8,3 +8,6 @@ fredapi >= 0.5.2
 pandas>=2.2.0
 plotly>=5.18.0
 yfinance>=0.2.37
+aiohttp>=3.9.0
+websockets>=12.0
+streamlit-autorefresh>=0.0.1
