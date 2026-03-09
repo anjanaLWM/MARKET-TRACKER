@@ -9,6 +9,8 @@ from datetime import datetime
 
 import requests
 import streamlit as st
+import pandas as pd
+import plotly.express as px
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
@@ -188,6 +190,25 @@ def fetch_prices() -> dict:
     except Exception as e:
         return {"error": str(e), "data": {}, "categories": {}}
 
+def fetch_news(since=None) -> dict:
+    url = f"{BACKEND_URL}/news"
+    if since:
+        url += f"?since_timestamp={since}"
+    try:
+        r = requests.get(url, timeout=4)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"items": [], "scraped_at": None, "error": str(e)}
+
+def fetch_historical(symbol: str, time_range: str = "1Y") -> dict:
+    try:
+        r = requests.get(f"{BACKEND_URL}/api/historical?symbol={symbol}&range={time_range}", timeout=6)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e), "data": []}
+
 
 def fmt_price(price: float, symbol: str) -> str:
     if symbol in {"BTC/USDT", "ETH/USDT"}:
@@ -209,22 +230,98 @@ def render_card(record: dict) -> str:
     arrow   = "▲" if chg >= 0 else "▼"
     cls     = "card-change-up" if chg >= 0 else "card-change-down"
 
+    # Clicking the card will navigate to the commodity page
     return f"""
-    <div class="price-card">
-        <div class="card-symbol">{symbol}</div>
-        <div class="card-price">{fmt_price(price, symbol)}</div>
-        <div class="{cls}">{arrow} {abs(chg_pct):.3f}%</div>
-        <div class="card-time">🕐 {t}</div>
-        <div class="card-vol">vol {vol:,.4f}</div>
-    </div>
+    <a href="/?symbol={symbol}" target="_self" style="text-decoration: none; color: inherit;">
+        <div class="price-card">
+            <div class="card-symbol">{symbol}</div>
+            <div class="card-price">{fmt_price(price, symbol)}</div>
+            <div class="{cls}">{arrow} {abs(chg_pct):.3f}%</div>
+            <div class="card-time">🕐 {t}</div>
+            <div class="card-vol">vol {vol:,.4f}</div>
+        </div>
+    </a>
     """
 
 
 def render_no_data() -> str:
     return '<div class="price-card"><div class="no-data">⏳ Waiting for data…</div></div>'
 
+def render_historical_page(symbol: str):
+    # Back button
+    if st.button("← Back to Dashboard"):
+        st.query_params.clear()
+        st.rerun()
+    
+    st.markdown(f'<div class="dash-title">📉 {symbol} Historical</div>', unsafe_allow_html=True)
+    
+    # Range selector
+    col_range, _ = st.columns([1, 4])
+    with col_range:
+        time_range = st.select_slider(
+            "Select Range",
+            options=["1M", "3M", "6M", "1Y", "5Y", "MAX"],
+            value="1Y"
+        )
+    
+    # Fetch data
+    with st.spinner(f"Loading {time_range} data for {symbol}..."):
+        result = fetch_historical(symbol, time_range)
+    
+    if "error" in result:
+        st.error(f"Error: {result['error']}")
+        if st.button("Retry"):
+            st.rerun()
+        return
+    
+    data = result.get("data", [])
+    if not data:
+        st.warning("No historical data available for this range.")
+        return
+    
+    # Render chart
+    df = pd.DataFrame(data)
+    df['date'] = pd.to_datetime(df['date'])
+    
+    fig = px.line(df, x='date', y='price', title=f"{symbol} Price Movement ({time_range})")
+    
+    # Modern styling for the chart
+    fig.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font_color='#c9d8e8',
+        margin=dict(l=0, r=0, t=40, b=0),
+        xaxis=dict(showgrid=True, gridcolor='#1a2a40', title="Date"),
+        yaxis=dict(showgrid=True, gridcolor='#1a2a40', title="Price"),
+    )
+    fig.update_traces(line_color='#00e5a0', line_width=2)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Show stats
+    if not df.empty:
+        c1, c2, c3 = st.columns(3)
+        current_p = df['price'].iloc[-1]
+        start_p = df['price'].iloc[0]
+        nodes = len(df)
+        
+        c1.metric("Current Price", fmt_price(current_p, symbol))
+        c2.metric("Period Start", fmt_price(start_p, symbol))
+        
+        chg = current_p - start_p
+        chg_pct = (chg / start_p) * 100
+        c3.metric("Period Change", f"{chg_pct:+.2f}%", delta=f"{chg:+.2f}")
+
 
 # ── Main render ───────────────────────────────────────────────────────────────
+# Navigation check
+target_symbol = st.query_params.get("symbol")
+
+if target_symbol:
+    render_historical_page(target_symbol)
+    # Stop execution here for the historical page view
+    st.stop()
+
 # Header
 st.markdown(
     """
@@ -260,30 +357,96 @@ if err:
     time.sleep(3)
     st.rerun()
 
+# News fetching
+if "news_items" not in st.session_state:
+    st.session_state.news_items = []
+if "last_news_fetch_time" not in st.session_state:
+    st.session_state.last_news_fetch_time = 0
+if "news_scraped_at" not in st.session_state:
+    st.session_state.news_scraped_at = None
+
+current_time = time.time()
+if current_time - st.session_state.last_news_fetch_time >= 600: # 10 minutes
+    news_payload = fetch_news(st.session_state.news_scraped_at)
+    new_items = news_payload.get("items", [])
+    
+    # Prepend new items and deduplicate based on URL/Title
+    if new_items:
+        existing_urls = {item.get("url") for item in st.session_state.news_items}
+        filtered_new = [item for item in new_items if item.get("url") not in existing_urls]
+        st.session_state.news_items = filtered_new + st.session_state.news_items
+        
+    if news_payload.get("scraped_at"):
+        st.session_state.news_scraped_at = news_payload.get("scraped_at")
+    st.session_state.last_news_fetch_time = current_time
+
 # Stats row
 active = len(prices)
 total  = sum(len(v) for v in cats.values())
 now    = datetime.now().strftime("%H:%M:%S")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Active Feeds", active, delta=None)
-col2.metric("Total Symbols", total)
-col3.metric("Last Update", now)
-col4.metric("Refresh Rate", f"{refresh}s")
+main_col, news_col = st.columns([3, 1], gap="large")
 
-# Per-category grids
-for cat_name, symbols in cats.items():
-    icon = CATEGORY_ICONS.get(cat_name, "")
-    st.markdown(f'<div class="cat-header">{icon} {cat_name}</div>', unsafe_allow_html=True)
+with main_col:
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Active Feeds", active, delta=None)
+    col2.metric("Total Symbols", total)
+    col3.metric("Last Update", now)
+    col4.metric("Refresh Rate", f"{refresh}s")
+    
+    # Per-category grids
+    for cat_name, symbols in cats.items():
+        icon = CATEGORY_ICONS.get(cat_name, "")
+        st.markdown(f'<div class="cat-header">{icon} {cat_name}</div>', unsafe_allow_html=True)
+    
+        cols = st.columns(4)
+        for i, sym in enumerate(symbols):
+            record = prices.get(sym)
+            with cols[i % 4]:
+                if record:
+                    st.markdown(render_card(record), unsafe_allow_html=True)
+                else:
+                    st.markdown(render_no_data(), unsafe_allow_html=True)
 
-    cols = st.columns(4)
-    for i, sym in enumerate(symbols):
-        record = prices.get(sym)
-        with cols[i % 4]:
-            if record:
-                st.markdown(render_card(record), unsafe_allow_html=True)
-            else:
-                st.markdown(render_no_data(), unsafe_allow_html=True)
+with news_col:
+    with st.expander("📰 News", expanded=True):
+        updated_str = "Never"
+        if st.session_state.news_scraped_at:
+            try:
+                dt = datetime.fromisoformat(st.session_state.news_scraped_at.replace("Z", "+00:00"))
+                updated_str = dt.astimezone().strftime("%H:%M")
+            except:
+                updated_str = "Unknown"
+                
+        st.markdown(f"<div style='font-size: 0.8em; color: #888; margin-bottom: 10px;'>Updated at {updated_str}</div>", unsafe_allow_html=True)
+        
+        for item in st.session_state.news_items[:20]: # show top 20
+            # format related time
+            pub_date_str = item.get("published_at")
+            relative_time = pub_date_str
+            if pub_date_str:
+                try:
+                    pub_dt = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                    diff = datetime.now(pub_dt.tzinfo) - pub_dt
+                    if diff.total_seconds() < 3600:
+                        relative_time = f"{int(diff.total_seconds() / 60)} min ago"
+                    elif diff.total_seconds() < 86400:
+                        relative_time = f"{int(diff.total_seconds() / 3600)} hr ago"
+                    else:
+                        relative_time = f"{int(diff.total_seconds() / 86400)} days ago"
+                except:
+                    pass
+                    
+            st.markdown(f"""
+            <div style='margin-bottom: 12px; border-bottom: 1px solid #1a2a40; padding-bottom: 8px;'>
+                <div style='font-size: 0.9em; font-weight: bold; margin-bottom: 4px;'>
+                    <a href='{item.get("url")}' target='_blank' style='color: #c9d8e8; text-decoration: none;'>{item.get("title")}</a>
+                </div>
+                <div style='font-size: 0.7em; color: #666;'>
+                    {item.get("source_name")} • {relative_time}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 # Status bar
 st.markdown(
