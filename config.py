@@ -37,8 +37,8 @@ SYMBOL_MAP: Dict[str, str] = {
     "OANDA:HK33_HKD":   "HANG SENG",
     "OANDA:CN50_USD":   "SHANGHAI COMP",
     # ── Risk factors ──────────────────────────────────────────────────────────
-    "OANDA:VIX_USD":    "VIX",
-    "OANDA:USDOLLAR":   "DXY",
+    #"OANDA:VIX_USD":    "VIX",
+    #"OANDA:USDOLLAR":   "DXY",
     # ── Crypto ────────────────────────────────────────────────────────────────
     "BINANCE:BTCUSDT":  "BTC/USDT",
     "BINANCE:ETHUSDT":  "ETH/USDT",
