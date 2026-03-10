@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from config import SYMBOL_MAP, CATEGORIES
+from config import SYMBOL_MAP, CATEGORIES, WS_EXCLUDED_SYMBOLS
 from PricesStore import PricesStore
 from WebSocket import WebSocketManager
 from NewsStore import NewsStore
@@ -28,11 +28,22 @@ finhub_api_key = os.getenv("FinHubAPI")
 # ── Global Stores ───────────────────────────────────────────────────────────
 price_store = PricesStore()
 news_store = NewsStore(api_token=finhub_api_key)
+# WebSocket symbols: OANDA/BINANCE prefixed, minus any explicitly excluded ones
+ws_symbols = [
+    s for s in SYMBOL_MAP.keys()
+    if (s.startswith("OANDA:") or s.startswith("BINANCE:"))
+    and s not in WS_EXCLUDED_SYMBOLS
+]
+# Yahoo-polled: everything not going through the WebSocket
+yahoo_symbols = [s for s in SYMBOL_MAP.keys() if s not in ws_symbols]
+
 websocket_manager = WebSocketManager(
-    symbols=list(SYMBOL_MAP.keys()), 
-    store=price_store, 
-    FINNHUB_TOKEN=finhub_api_key
+    symbols=ws_symbols,
+    store=price_store,
+    FINNHUB_TOKEN=finhub_api_key,
+    excluded_symbols=WS_EXCLUDED_SYMBOLS,
 )
+
 
 # ── Historical Cache ────────────────────────────────────────────────────────
 historical_cache = {}
@@ -47,6 +58,43 @@ RANGE_MAP = {
     "MAX": timedelta(days=365*10),
 }
 
+import yfinance as yf
+def get_current_yahoo_price(symbol: str) -> Optional[Dict]:
+    """
+    Fetch the current price for a symbol via yfinance.
+    fast_info is NOT a dict — access its attributes via getattr.
+    Falls back to recent 1-day history if fast_info attributes are unavailable.
+    """
+    from historical import YFINANCE_TICKERS
+    ticker = YFINANCE_TICKERS.get(symbol, symbol)
+    try:
+        t = yf.Ticker(ticker)
+        info = t.fast_info  # LazyTimedCache object, NOT a dict
+
+        # Try preferred attribute, then fallback attribute
+        price = getattr(info, 'last_price', None)
+        if price is None:
+            price = getattr(info, 'regular_market_price', None)
+
+        if price is None:
+            # Last resort: pull the most recent close from 1-day history
+            hist = t.history(period="1d")
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+
+        if price is not None and float(price) > 0:
+            return {
+                "p": float(price),
+                "v": 0.0,
+                "t": int(datetime.now().timestamp() * 1000),
+            }
+        else:
+            logger.warning(f"[Yahoo] No valid price for {symbol} (ticker={ticker})")
+    except Exception as e:
+        logger.error(f"[Yahoo] Error polling {symbol} (ticker={ticker}): {e}")
+    return None
+
+
 # ── Background Tasks ────────────────────────────────────────────────────────
 async def news_fetcher_task():
     """Periodically fetches news to keep the store updated."""
@@ -58,6 +106,30 @@ async def news_fetcher_task():
             logger.error(f"Error in background news fetch: {e}")
         
         await asyncio.sleep(600) # Fetch every 10 minutes
+
+async def yahoo_poller_task():
+    """Periodically fetches prices from Yahoo Finance for non-WS symbols."""
+    while True:
+        if not yahoo_symbols:
+            break
+        
+        logger.info(f"Polling Yahoo Finance for {len(yahoo_symbols)} symbols")
+        # Run in executor to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        for sym in yahoo_symbols:
+            try:
+                data = await loop.run_in_executor(None, get_current_yahoo_price, sym)
+                if data:
+                    price_store.update(
+                        raw_symbol=sym,
+                        price=data["p"],
+                        volume=data["v"],
+                        ts_ms=data["t"]
+                    )
+            except Exception as e:
+                logger.error(f"Failed to poll {sym}: {e}")
+        
+        await asyncio.sleep(120) # Poll every 2 minutes
 
 async def cache_cleanup_task():
     """Periodically cleans up the historical data cache."""
@@ -80,6 +152,7 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     news_task = asyncio.create_task(news_fetcher_task())
     cleanup_task = asyncio.create_task(cache_cleanup_task())
+    yahoo_task = asyncio.create_task(yahoo_poller_task())
     
     logger.info("Application started, background tasks running")
     yield
@@ -88,6 +161,7 @@ async def lifespan(app: FastAPI):
     await websocket_manager.stop()
     news_task.cancel()
     cleanup_task.cancel()
+    yahoo_task.cancel()
     logger.info("Application shutting down")
 
 # ── FastAPI App ─────────────────────────────────────────────────────────────

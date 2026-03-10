@@ -10,9 +10,22 @@ logger = logging.getLogger(__name__)
 class WebSocketManager:
     """
     Manages an asynchronous WebSocket connection to Finnhub.
+    excluded_symbols: symbols to always skip even if passed in the symbols list
+    (safety net for symbols not supported on the free Finnhub WS tier).
     """
-    def __init__(self, symbols: List[str], store: "PricesStore", FINNHUB_TOKEN: str):
-        self.symbols = symbols
+    def __init__(
+        self,
+        symbols: List[str],
+        store: "PricesStore",
+        FINNHUB_TOKEN: str,
+        excluded_symbols: Optional[List[str]] = None,
+    ):
+        _excluded = set(excluded_symbols or [])
+        self.symbols = [s for s in symbols if s not in _excluded]
+        if _excluded:
+            dropped = [s for s in symbols if s in _excluded]
+            if dropped:
+                logger.info(f"[WS] Excluded from subscription: {dropped}")
         self.store = store
         self.FINNHUB_TOKEN = FINNHUB_TOKEN
         self.ws_url = f"wss://ws.finnhub.io?token={self.FINNHUB_TOKEN}"
@@ -36,12 +49,18 @@ class WebSocketManager:
                     logger.error(f"[WS] API Error: {err_msg}")
                     # If the error contains a symbol, update it in the store
                     sym = data.get("symbol")
+                    if not sym:
+                        # Attempt to parse symbol from message e.g. "Invalid symbol OANDA:IN50_USD"
+                        if "symbol" in err_msg.lower():
+                            parts = err_msg.split()
+                            if parts:
+                                last_part = parts[-1]
+                                sym = last_part
+                    
                     if sym:
                         self.store.update_error(sym, err_msg)
                     else:
-                        # Global error?
-                        for s in self.symbols:
-                            self.store.update_error(s, err_msg)
+                        logger.warning(f"[WS] Could not associate error with symbol: {err_msg}")
             except Exception as e:
                 logger.error(f"[WS] Error processing message: {e}")
 
